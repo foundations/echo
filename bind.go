@@ -1,6 +1,7 @@
 package echo
 
 import (
+	"encoding"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -21,6 +22,8 @@ type (
 	DefaultBinder struct{}
 
 	// BindUnmarshaler is the interface used to wrap the UnmarshalParam method.
+	// Types that don't implement this, but do implement encoding.TextUnmarshaler
+	// will use that interface instead.
 	BindUnmarshaler interface {
 		// UnmarshalParam decodes and assigns a value from an form or query param.
 		UnmarshalParam(param string) error
@@ -30,6 +33,17 @@ type (
 // Bind implements the `Binder#Bind` function.
 func (b *DefaultBinder) Bind(i interface{}, c Context) (err error) {
 	req := c.Request()
+
+	names := c.ParamNames()
+	values := c.ParamValues()
+	params := map[string][]string{}
+	for i, name := range names {
+		params[name] = []string{values[i]}
+	}
+	if err := b.bindData(i, params, "param"); err != nil {
+		return NewHTTPError(http.StatusBadRequest, err.Error()).SetInternal(err)
+	}
+
 	if req.ContentLength == 0 {
 		if req.Method == http.MethodGet || req.Method == http.MethodDelete {
 			if err = b.bindData(i, c.QueryParams(), "query"); err != nil {
@@ -74,8 +88,18 @@ func (b *DefaultBinder) Bind(i interface{}, c Context) (err error) {
 }
 
 func (b *DefaultBinder) bindData(ptr interface{}, data map[string][]string, tag string) error {
+	if ptr == nil || len(data) == 0 {
+		return nil
+	}
 	typ := reflect.TypeOf(ptr).Elem()
 	val := reflect.ValueOf(ptr).Elem()
+
+	if m, ok := ptr.(*map[string]interface{}); ok {
+		for k, v := range data {
+			(*m)[k] = v[0]
+		}
+		return nil
+	}
 
 	if typ.Kind() != reflect.Struct {
 		return errors.New("binding element must be a struct")
@@ -211,12 +235,30 @@ func bindUnmarshaler(field reflect.Value) (BindUnmarshaler, bool) {
 	return nil, false
 }
 
+// textUnmarshaler attempts to unmarshal a reflect.Value into a TextUnmarshaler
+func textUnmarshaler(field reflect.Value) (encoding.TextUnmarshaler, bool) {
+	ptr := reflect.New(field.Type())
+	if ptr.CanInterface() {
+		iface := ptr.Interface()
+		if unmarshaler, ok := iface.(encoding.TextUnmarshaler); ok {
+			return unmarshaler, ok
+		}
+	}
+	return nil, false
+}
+
 func unmarshalFieldNonPtr(value string, field reflect.Value) (bool, error) {
 	if unmarshaler, ok := bindUnmarshaler(field); ok {
 		err := unmarshaler.UnmarshalParam(value)
 		field.Set(reflect.ValueOf(unmarshaler).Elem())
 		return true, err
 	}
+	if unmarshaler, ok := textUnmarshaler(field); ok {
+		err := unmarshaler.UnmarshalText([]byte(value))
+		field.Set(reflect.ValueOf(unmarshaler).Elem())
+		return true, err
+	}
+
 	return false, nil
 }
 
